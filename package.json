@@ -1,0 +1,15 @@
+{
+  "name": "milap-server",
+  "version": "1.0.0",
+  "description": "Milap Chat Server - Real-time messaging with MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.5",
+    "mongoose": "^8.0.0",
+    "cors": "^2.8.5"
+  }
+}
