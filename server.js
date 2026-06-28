@@ -1,155 +1,30 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
+const express=require('express'),http=require('http'),{Server}=require('socket.io'),mongoose=require('mongoose'),cors=require('cors'),bcrypt=require('bcryptjs'),jwt=require('jsonwebtoken');
+const app=express();app.use(cors());app.use(express.json({limit:'10mb'}));
+const server=http.createServer(app),io=new Server(server,{cors:{origin:'*'},transports:['websocket','polling']});
+const URI=process.env.MONGODB_URI||'mongodb://localhost:27017/milap',MASTER=process.env.MASTER_CODE||'MILAP-FIRST',JWT=process.env.JWT_SECRET||'change-me';
+mongoose.connect(URI).then(()=>console.log('DB OK')).catch(e=>console.error(e));
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const U=mongoose.model('User',new mongoose.Schema({email:{type:String,unique:true,lowercase:true,trim:true},password:String,username:{type:String,trim:true},bio:String,profilePic:String,inviteCode:{type:String,unique:true,default:()=>'MILAP-'+Math.random().toString(36).slice(2,7).toUpperCase()},contacts:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],privacy:{profilePic:{type:String,default:'contacts'}},status:{type:String,default:''},statusTime:{type:Date,default:Date.now}}));
+const G=mongoose.model('Group',new mongoose.Schema({name:String,admin:{type:mongoose.Schema.Types.ObjectId,ref:'User'},members:[{type:mongoose.Schema.Types.ObjectId,ref:'User'}],createdAt:{type:Date,default:Date.now}}));
+const M=mongoose.model('Message',new mongoose.Schema({from:{type:mongoose.Schema.Types.ObjectId,ref:'User',required:true},to:{type:mongoose.Schema.Types.ObjectId,required:true},toType:{type:String,enum:['user','group'],default:'user'},type:{type:String,enum:['text','image','audio','video','file','sos'],default:'text'},text:String,filename:String,mimeType:String,expiresAt:Date,read:{type:Boolean,default:false},timestamp:{type:Date,default:Date.now}}));
+M.schema.index({expiresAt:1},{expireAfterSeconds:0});
 
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' }, transports: ['websocket', 'polling'] });
+const auth=(req,res,next)=>{const t=req.headers.authorization?.split(' ')[1];if(!t)return res.status(401).json({error:'No token'});try{req.user=jwt.verify(t,JWT);next();}catch{res.status(401).json({error:'Invalid'});}};
 
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/milap';
-const MASTER_CODE = process.env.MASTER_CODE || 'MILAP-FIRST';
-const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-render-env';
+app.post('/register',async(req,res)=>{try{const{email,password,username,inviteCode}=req.body;if(!email||!password||!username||!inviteCode)return res.status(400).json({error:'All fields'});const ex=await U.findOne({email:email.toLowerCase().trim()});if(ex)return res.status(400).json({error:'Exists'});if(password.length<6)return res.status(400).json({error:'Short'});let inv=null;if(inviteCode!==MASTER){inv=await U.findOne({inviteCode:inviteCode.trim().toUpperCase()});if(!inv)return res.status(400).json({error:'Bad code'});}const h=await bcrypt.hash(password,10);const u=new U({email:email.toLowerCase().trim(),password:h,username:username.trim()});if(inv){u.contacts=[inv._id];inv.contacts.push(u._id);await inv.save();}await u.save();const t=jwt.sign({id:u._id,username:u.username},JWT,{expiresIn:'7d'});res.json({token:t,user:{_id:u._id,email:u.email,username:u.username,inviteCode:u.inviteCode}});}catch(e){res.status(500).json({error:e.message});}});
+app.post('/login',async(req,res)=>{try{const{email,password}=req.body;const u=await U.findOne({email:email.toLowerCase().trim()});if(!u||!await bcrypt.compare(password,u.password))return res.status(400).json({error:'Invalid'});const t=jwt.sign({id:u._id,username:u.username},JWT,{expiresIn:'7d'});res.json({token:t,user:{_id:u._id,email:u.email,username:u.username,inviteCode:u.inviteCode,profilePic:u.profilePic,privacy:u.privacy}});}catch(e){res.status(500).json({error:e.message});}});
+app.get('/me',auth,async(req,res)=>{try{const u=await U.findById(req.user.id).populate('contacts','username email profilePic privacy status').select('-password');res.json(u);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/profile',auth,async(req,res)=>{try{const{username,bio,status,profilePic}=req.body;const up={};if(username)up.username=username.trim();if(bio!==undefined)up.bio=bio.trim();if(status!==undefined){up.status=status.trim();up.statusTime=new Date();}if(profilePic)up.profilePic=profilePic;const u=await U.findByIdAndUpdate(req.user.id,up,{new:true}).select('-password');res.json(u);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/privacy',auth,async(req,res)=>{try{const{profilePic}=req.body;const u=await U.findById(req.user.id);if(profilePic)u.privacy.profilePic=profilePic;await u.save();res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.post('/group',auth,async(req,res)=>{try{const{name,members}=req.body;if(!name)return res.status(400).json({error:'Need name'});const g=new G({name:name.trim(),admin:req.user.id,members:[...(members||[]),req.user.id]});await g.save();res.json(g);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/groups',auth,async(req,res)=>{try{const groups=await G.find({members:req.user.id}).populate('members','username email profilePic').sort({createdAt:-1});res.json(groups);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/search',auth,async(req,res)=>{try{const q=req.query.q?.trim();if(!q)return res.json([]);const users=await U.find({$or:[{email:q.toLowerCase()},{username:{$regex:q,$options:'i'}}],_id:{$ne:req.user.id}}).select('username email profilePic inviteCode');res.json(users);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/add-contact',auth,async(req,res)=>{try{const me=await U.findById(req.user.id);const id=req.body.userId;if(!me.contacts.includes(id)){me.contacts.push(id);await me.save();}res.json({ok:true});}catch(e){res.status(500).json({error:e.message});}});
+app.get('/messages/:contactId',auth,async(req,res)=>{try{const msgs=await M.find({toType:'user',$or:[{from:req.user.id,to:req.params.contactId},{from:req.params.contactId,to:req.user.id}]}).populate('from','username profilePic').sort({timestamp:1}).limit(200).lean();res.json(msgs);}catch(e){res.status(500).json({error:e.message});}});
+app.get('/group-messages/:groupId',auth,async(req,res)=>{try{const g=await G.findById(req.params.groupId);if(!g||!g.members.map(String).includes(req.user.id))return res.status(403).json({error:'Member only'});const msgs=await M.find({toType:'group',to:req.params.groupId}).populate('from','username profilePic').sort({timestamp:1}).limit(300).lean();res.json(msgs);}catch(e){res.status(500).json({error:e.message});}});
+app.post('/sos',auth,async(req,res)=>{try{const u=await U.findById(req.user.id).populate('contacts');const txt='🚨 SOS from '+u.username+' at '+new Date().toLocaleString()+'\nLoc: '+(req.body.location||'Unknown');await Promise.all(u.contacts.map(c=>new M({from:req.user.id,to:c._id,toType:'user',type:'sos',text:txt}).save().then(m=>{io.to(c._id.toString()).emit('message',m);})));res.json({ok:true,sent:u.contacts.length});}catch(e){res.status(500).json({error:e.message});}});
+app.get('/',(req,res)=>res.json({name:'Milap',status:'ok'}));
 
-mongoose.connect(MONGODB_URI).then(() => console.log('MongoDB OK')).catch(e => console.error(e));
-
-const userSchema = new mongoose.Schema({
-  email: { type: String, unique: true, required: true, lowercase: true, trim: true },
-  password: { type: String, required: true },
-  username: { type: String, required: true, trim: true },
-  inviteCode: { type: String, unique: true, default: () => 'MILAP-' + Math.random().toString(36).slice(2, 7).toUpperCase() },
-  contacts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }]
-});
-const User = mongoose.model('User', userSchema);
-
-const msgSchema = new mongoose.Schema({
-  from: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  to: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  text: { type: String, required: true },
-  read: { type: Boolean, default: false },
-  timestamp: { type: Date, default: Date.now }
-});
-const Message = mongoose.model('Message', msgSchema);
-
-function auth(req, res, next) {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (!token) return res.status(401).json({ error: 'No token' });
-  try { req.user = jwt.verify(token, JWT_SECRET); next(); } catch { res.status(401).json({ error: 'Invalid token' }); }
-}
-
-app.post('/register', async (req, res) => {
-  try {
-    const { email, password, username, inviteCode } = req.body;
-    if (!email || !password || !username || !inviteCode) return res.status(400).json({ error: 'All fields required' });
-    const existing = await User.findOne({ email: email.toLowerCase().trim() });
-    if (existing) return res.status(400).json({ error: 'Email already registered' });
-    if (password.length < 6) return res.status(400).json({ error: 'Password too short' });
-    
-    let inviter = null;
-    if (inviteCode !== MASTER_CODE) {
-      inviter = await User.findOne({ inviteCode: inviteCode.trim().toUpperCase() });
-      if (!inviter) return res.status(400).json({ error: 'Invalid invite code' });
-    }
-    
-    const hash = await bcrypt.hash(password, 10);
-    const user = new User({ email: email.toLowerCase().trim(), password: hash, username: username.trim() });
-    if (inviter) user.contacts = [inviter._id];
-    await user.save();
-    
-    if (inviter) {
-      inviter.contacts.push(user._id);
-      await inviter.save();
-    }
-    
-    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { email: user.email, username: user.username, inviteCode: user.inviteCode } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user || !await bcrypt.compare(password, user.password)) return res.status(400).json({ error: 'Invalid credentials' });
-    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { email: user.email, username: user.username, inviteCode: user.inviteCode } });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/me', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id).populate('contacts', 'username email inviteCode');
-    res.json(user);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/search', auth, async (req, res) => {
-  try {
-    const q = req.query.q?.trim();
-    if (!q) return res.json([]);
-    const users = await User.find({ 
-      $or: [{ email: q.toLowerCase() }, { username: { $regex: q, $options: 'i' } }],
-      _id: { $ne: req.user.id }
-    }).select('username email inviteCode');
-    res.json(users);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/add-contact', auth, async (req, res) => {
-  try {
-    const me = await User.findById(req.user.id);
-    if (!me.contacts.includes(req.body.userId)) {
-      me.contacts.push(req.body.userId);
-      await me.save();
-    }
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/messages/:contactId', auth, async (req, res) => {
-  try {
-    const msgs = await Message.find({
-      $or: [
-        { from: req.user.id, to: req.params.contactId },
-        { from: req.params.contactId, to: req.user.id }
-      ]
-    }).sort({ timestamp: 1 }).limit(200).lean();
-    res.json(msgs);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/', (req, res) => res.json({ name: 'Milap', status: 'running' }));
-
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next(new Error('No token'));
-  try { socket.user = jwt.verify(token, JWT_SECRET); next(); } catch { next(new Error('Bad token')); }
-});
-
-io.on('connection', (socket) => {
-  const uid = socket.user.id;
-  socket.join(uid);
-  
-  socket.on('message', async ({ to, text }) => {
-    if (!to || !text?.trim()) return;
-    try {
-      const msg = new Message({ from: uid, to, text: text.trim().substring(0, 1000) });
-      await msg.save();
-      const payload = { _id: msg._id, from: { _id: uid, username: socket.user.username }, to, text: msg.text, timestamp: msg.timestamp };
-      io.to(to).emit('message', payload);
-      io.to(uid).emit('message', payload);
-    } catch (e) { console.error(e); }
-  });
-  
-  socket.on('disconnect', () => {});
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server on ${PORT}`));
+io.use((socket,next)=>{const t=socket.handshake.auth?.token;if(!t)return next(new Error('No token'));try{socket.user=jwt.verify(t,JWT);next();}catch{next(new Error('Bad'));}});
+io.on('connection',(socket)=>{const uid=socket.user.id.toString();socket.join(uid);socket.on('join-group',gid=>socket.join(gid));socket.on('message',async({to,toType,text,type,filename,mimeType,expiresAt})=>{if(!to||!text?.trim())return;try{const m=new M({from:uid,to,toType:toType||'user',type:type||'text',text:text.trim(),filename:filename||'',mimeType:mimeType||'',expiresAt:expiresAt?new Date(expiresAt):undefined});await m.save();const pop=await M.findById(m._id).populate('from','username profilePic').lean();if(toType==='group')io.to(to).emit('message',pop);else{io.to(to).emit('message',pop);io.to(uid).emit('message',pop);}}catch(e){console.error(e);}});socket.on('disconnect',()=>{});});
+const PORT=process.env.PORT||3000;server.listen(PORT,()=>console.log('Port '+PORT));
